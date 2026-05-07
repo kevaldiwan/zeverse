@@ -9,9 +9,17 @@ import {
   type Workflow,
 } from "../workflows";
 import { matchWorkflowKeyword } from "../workflow-infer";
+import { extractBranchHint, resolveCheckoutBaseBranch, workflowDeclaresBranchInput } from "../branch-hint";
 import { extractPrdDocUrl } from "../prd-doc-url";
 import { startRun, runSingleStep } from "../runner";
 import { assertAllowed, appendAuditLog, PolicyError } from "../policy";
+import {
+  mapUnifiedParsedToHarnessResponse,
+  mapPrdThreadParsedToHarnessResponse,
+  type HarnessRouteSuggestion,
+} from "./harness-route-map";
+
+export type { HarnessRouteSuggestion };
 
 export const harnessRoutes = Router();
 
@@ -22,15 +30,8 @@ function extractFreshreleaseTaskUrl(text: string): string | undefined {
   return m?.[0];
 }
 
-export interface HarnessRouteSuggestion {
-  workflow: string;
-  inputs: Record<string, string>;
-  confidence: number;
-  reason: string;
-}
-
 interface HarnessRouteResponse {
-  type: "proposal" | "answer" | "clarify";
+  type: "proposal" | "answer" | "answer_with_proposal" | "clarify";
   repoId: string | null;
   workflow?: string;
   inputs?: Record<string, string>;
@@ -41,7 +42,16 @@ interface HarnessRouteResponse {
   reason: string;
   answer?: string;
   question?: string;
+  /** Contextual follow-up when `type` is clarify (may duplicate `question`). */
+  clarifyingQuestion?: string;
   missing?: string[];
+  /** PRD thread reply routing (Slack); see `surface: prd_thread`. */
+  prdThreadMatch?: {
+    queryIndex: number | null;
+    suggestion: string | null;
+    conversationalReply?: string;
+    noMatchExplanation?: string;
+  };
 }
 
 const CONFIDENCE_THRESHOLD = 0.6;
@@ -162,6 +172,17 @@ async function inferRepoId(prompt: string): Promise<{ repoId: string | null; rea
   }
 }
 
+function extractJsonObject(raw: string): Record<string, unknown> | null {
+  const trimmed = raw.trim();
+  const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) return null;
+  try {
+    return JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * POST /api/harness/route
  *
@@ -169,7 +190,8 @@ async function inferRepoId(prompt: string): Promise<{ repoId: string | null; rea
  */
 harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
   try {
-    const { prompt, repoId: requestedRepoId, threadContext, surface } = req.body ?? {};
+    const { prompt, repoId: requestedRepoId, threadContext, surface, prdQueries: prdQueriesRaw } =
+      req.body ?? {};
     if (!prompt) {
       res.status(400).json({ error: "prompt is required" });
       return;
@@ -243,6 +265,79 @@ harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
       return;
     }
 
+    const allWorkflowNames = workflows.map((w) => w.name);
+
+    // PRD Slack-thread reply assistant (never use keyword shortcuts here)
+    if (
+      surface === "prd_thread" &&
+      Array.isArray(prdQueriesRaw) &&
+      prdQueriesRaw.length > 0
+    ) {
+      const prdQueries = (
+        prdQueriesRaw as { index?: unknown; body?: unknown }[]
+      ).filter((q) => q && typeof q.index === "number" && typeof q.body === "string");
+
+      if (prdQueries.length > 0) {
+        const repoRules = loadRepoRules(repo);
+        const llmPrd = createLLMProvider(loadConfig());
+        const openList = prdQueries
+          .map((q) => `Q${q.index}: ${q.body}`)
+          .join("\n");
+
+        const prdSystem = [
+          "You assist with Slack replies in a PRD (product requirements) analysis thread tied to Google Doc comments.",
+          "Given open numbered questions and the user's latest Slack message, decide what to do.",
+          "",
+          "Respond with ONLY a JSON object (no markdown fences, no prose):",
+          "{",
+          '  "matchIndex": <0 if none, else the question number matching one of the listed Q numbers>,',
+          '  "suggestionForDoc": "<concise text suitable as a Google Doc comment reply when matchIndex>0; empty string otherwise>",',
+          '  "conversationalReply": "<Slack-ready reply when the user is NOT answering any listed question but needs a human-like answer; empty string otherwise>",',
+          '  "noMatchExplanation": "<one short sentence when matchIndex is 0 and conversationalReply is empty; why you could not map the reply>"',
+          "}",
+          "",
+          "Rules:",
+          "- If the user clearly answers one question, set matchIndex to that Q number and fill suggestionForDoc.",
+          "- If they ask something else or discuss generally, use conversationalReply and keep matchIndex 0.",
+          "- Never invent Q numbers that were not listed.",
+          ...(repoRules
+            ? ["", `Repo conventions for ${repoId} (optional context):`, repoRules]
+            : []),
+        ].join("\n");
+
+        const prdUser = [
+          `Open PRD questions:\n${openList}`,
+          threadContext ? `\nSlack thread so far:\n${threadContext}` : "",
+          `\nLatest user Slack reply:\n${prompt}`,
+        ].join("\n");
+
+        const prdResp = await llmPrd.chat([
+          { role: "system", content: prdSystem },
+          { role: "user", content: prdUser },
+        ]);
+        let prdParsed = extractJsonObject(prdResp.content);
+        if (!prdParsed) {
+          const prdRetry = await llmPrd.chat([
+            { role: "system", content: prdSystem },
+            { role: "user", content: prdUser },
+            {
+              role: "user",
+              content:
+                "Your last response was not valid JSON. Reply again with ONLY the JSON object described in the system message.",
+            },
+          ]);
+          prdParsed = extractJsonObject(prdRetry.content) ?? {};
+        }
+
+        const prdOut = mapPrdThreadParsedToHarnessResponse({
+          parsed: prdParsed,
+          repoId,
+        });
+        res.json(prdOut satisfies HarnessRouteResponse);
+        return;
+      }
+    }
+
     // 1. Keyword shortcut for high-confidence matches
     const keywordWorkflow = matchWorkflowKeyword(prompt, workflowNames);
     if (keywordWorkflow) {
@@ -252,6 +347,10 @@ harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
       if (keywordWorkflow === "prd-analysis") {
         const docUrl = extractPrdDocUrl(prompt);
         if (docUrl) inputs.docUrl = docUrl;
+      }
+      if (keywordWorkflow === "test" || keywordWorkflow === "test-fix") {
+        const bh = extractBranchHint(prompt, repoId);
+        if (bh) inputs.branch = bh;
       }
 
       const reason = `Keyword routing → ${keywordWorkflow}`;
@@ -301,44 +400,76 @@ harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
           const routeInputs = { ...inputs, catalog: catalogOutput };
           const routeOutput = await runSingleStep(repo, harnessWf, "route", routeInputs, config);
 
-          const jsonMatch = routeOutput.match(/\{[\s\S]*\}/);
-          if (jsonMatch) {
-            const parsed = JSON.parse(jsonMatch[0]);
-            const suggestions = buildTopSuggestionsFromParsed(parsed, prompt, workflowNames);
-            const wfName = typeof parsed.workflow === "string" ? parsed.workflow : "ask";
-            const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0;
-            const reason = typeof parsed.reason === "string" ? parsed.reason : "";
+          const jsonMatchDry = routeOutput.match(/\{[\s\S]*\}/);
+          if (jsonMatchDry) {
+            let parsedDry: Record<string, unknown>;
+            try {
+              parsedDry = JSON.parse(jsonMatchDry[0]) as Record<string, unknown>;
+            } catch {
+              parsedDry = {};
+            }
 
-            if (suggestions.length === 0) {
-              res.json({
-                type: "answer",
+            const suggestionsDry = buildTopSuggestionsFromParsed(
+              parsedDry,
+              prompt,
+              workflowNames
+            );
+            const wfName =
+              typeof parsedDry.workflow === "string" ? parsedDry.workflow : "ask";
+            const confidenceDry =
+              typeof parsedDry.confidence === "number" ? parsedDry.confidence : 0;
+            const reasonDry =
+              typeof parsedDry.reason === "string" ? parsedDry.reason : "";
+
+            if (suggestionsDry.length === 0) {
+              const mappedDry = mapUnifiedParsedToHarnessResponse({
+                parsed: parsedDry,
+                prompt,
+                suggestionsBuilt: suggestionsDry,
+                workflowNames,
+                allWorkflowNames,
                 repoId,
-                answer:
-                  reason ||
-                  `I couldn't confidently pick a workflow for that. Could you rephrase?`,
-                confidence,
-                reason: !workflowNames.has(wfName)
-                  ? `LLM picked unknown workflow "${wfName}"`
-                  : confidence < CONFIDENCE_THRESHOLD
-                    ? "Low confidence"
-                    : reason || "No valid suggestions",
+                confidenceFallback: confidenceDry,
+                reasonFallback: reasonDry,
+                wfNameParsed: wfName,
+                dryRunSuggestionsEmptyFallThrough: true,
+              });
+              if (mappedDry) {
+                res.json(mappedDry satisfies HarnessRouteResponse);
+                return;
+              }
+            } else {
+              const mappedWithAnswer = mapUnifiedParsedToHarnessResponse({
+                parsed: parsedDry,
+                prompt,
+                suggestionsBuilt: suggestionsDry,
+                workflowNames,
+                allWorkflowNames,
+                repoId,
+                confidenceFallback: confidenceDry,
+                reasonFallback: reasonDry,
+                wfNameParsed: wfName,
+                dryRunSuggestionsEmptyFallThrough: false,
+              });
+              if (mappedWithAnswer?.type === "answer_with_proposal") {
+                res.json(mappedWithAnswer satisfies HarnessRouteResponse);
+                return;
+              }
+
+              const primary = suggestionsDry[0];
+              const selectedNames = suggestionsDry.map((s) => s.workflow);
+              res.json({
+                type: "proposal",
+                repoId,
+                workflow: primary.workflow,
+                inputs: primary.inputs,
+                suggestions: suggestionsDry,
+                alternatives: proposalAlternativesExcluding(workflows, selectedNames),
+                confidence: primary.confidence,
+                reason: primary.reason,
               } satisfies HarnessRouteResponse);
               return;
             }
-
-            const primary = suggestions[0];
-            const selectedNames = suggestions.map((s) => s.workflow);
-            res.json({
-              type: "proposal",
-              repoId,
-              workflow: primary.workflow,
-              inputs: primary.inputs,
-              suggestions,
-              alternatives: proposalAlternativesExcluding(workflows, selectedNames),
-              confidence: primary.confidence,
-              reason: primary.reason,
-            } satisfies HarnessRouteResponse);
-            return;
           }
         } catch {
           // fall through to server-side LLM routing
@@ -346,7 +477,7 @@ harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
       }
     }
 
-    // 3. Fallback: server-side LLM routing (same as old route-intent)
+    // 3. Server-side unified LLM: intent + conversational answer + optional workflow suggestions
     const workflowCatalog = workflows
       .filter((w) => w.name !== "harness")
       .map((w) => {
@@ -361,109 +492,144 @@ harnessRoutes.post("/harness/route", async (req: Request, res: Response) => {
 
     const llm = createLLMProvider(loadConfig());
     const systemParts = [
-      "You are a smart intent router for a software development assistant.",
-      "Given a user prompt and a list of available workflows, pick up to 3 best-matching workflows (ordered by fit).",
-      "Also extract values for any workflow inputs that the prompt implicitly provides for each pick.",
-      "",
-      "Prefer responding with a top-level \"suggestions\" array (1 to 3 entries).",
-      "Each entry: workflow name, inputs object, confidence, reason.",
+      "You are a smart assistant for a software development workflow hub (Zeverse).",
+      "Read the user's latest message using the full Slack thread context when provided.",
+      "Decide intent, answer conversationally when they are asking questions, and/or suggest workflows when they want automation.",
       "",
       "Respond with ONLY a JSON object (no markdown fences, no prose):",
       "{",
+      '  "intent": "action" | "question" | "ambiguous",',
+      '  "answer": "<helpful reply; non-empty when intent is question OR when mixed; use repo rules below; empty only if intent is pure action>",',
+      '  "clarifyingQuestion": "<non-empty only when intent is ambiguous; MUST reference words from the user message>",',
       '  "suggestions": [',
       '    { "workflow": "<name>", "inputs": { "<inputId>": "<value>", ... }, "confidence": <0.0-1.0>, "reason": "<short>" },',
-      "    ... up to 3",
+      "    ... 0 to 3",
       "  ],",
-      '  "workflow": "<same as first suggestion; for backward compatibility>",',
+      '  "workflow": "<same as first suggestion; backward compatibility>",',
       '  "inputs": { ... },',
       '  "confidence": <number>,',
       '  "reason": "<string>"',
       "}",
       "",
       "Rules:",
-      "- Include at least one suggestion with confidence 0.6+ when there is a reasonable match.",
-      "- confidence 0.9+: prompt clearly matches that workflow.",
-      "- confidence 0.6-0.9: reasonable match but some ambiguity.",
-      '- confidence < 0.6: omit that workflow from suggestions (or use legacy workflow \"ask\" only if nothing qualifies).',
-      "- For inputs, map prompt content to the workflow's declared inputs.",
-      '  The main prompt text should go into the primary required input (usually "requirement").',
+      '- intent "action": user wants automation (fix, test, review, PRD analysis, etc.) — include suggestions with confidence 0.6+ for each good match.',
+      '- intent "question": user wants explanation, guidance, or discussion — always include a non-empty "answer" grounded in thread context and repo rules.',
+      '- intent "ambiguous": you need one specific follow-up — put it in "clarifyingQuestion" (not generic boilerplate).',
+      '- If the user both asks something AND a workflow would help, set intent to "question", fill "answer", and include a strong suggestion (confidence 0.6+).',
+      "- confidence 0.9+: clear match; 0.6-0.9: reasonable; omit entries below 0.6.",
+      '- Put the main user text in input "requirement" when mapping to workflows.',
       "- ONLY use workflow names from the provided list.",
-      "- If you only have one good match, return a single-element suggestions array.",
     ];
     if (repoRules) {
       systemParts.push(
         "",
-        `Repo rules and conventions for ${repoId} (use these to inform your routing and answers):`,
+        `Repo rules and conventions for ${repoId} (use for answers and routing):`,
         repoRules,
       );
     }
-    const response = await llm.chat([
-      { role: "system", content: systemParts.join("\n") },
-      {
-        role: "user",
-        content: `Available workflows:\n${workflowCatalog}\n\n${threadContext ? `Thread context:\n${threadContext}\n\n` : ""}User prompt: ${prompt}`,
-      },
-    ]);
 
-    const text = response.content.trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    const userContent = [
+      `Available workflows:\n${workflowCatalog}`,
+      threadContext ? `\nThread context:\n${threadContext}` : "",
+      `\nUser prompt:\n${prompt}`,
+    ].join("\n");
 
-    if (!jsonMatch) {
+    const runUnified = async (extraUser?: string) => {
+      const messages: { role: "system" | "user"; content: string }[] = [
+        { role: "system", content: systemParts.join("\n") },
+        { role: "user", content: userContent },
+      ];
+      if (extraUser) messages.push({ role: "user", content: extraUser });
+      const response = await llm.chat(messages);
+      return response.content.trim();
+    };
+
+    let text = await runUnified();
+    let parsed = extractJsonObject(text);
+    if (!parsed) {
       res.json({
         type: "answer",
         repoId,
-        answer: text || "Sorry, I couldn't understand that. Could you rephrase?",
+        answer: text
+          ? text
+          : [`You wrote: _${prompt}_`, "", "I could not parse a structured reply; try rephrasing or naming a concrete task."].join(
+              "\n"
+            ),
         confidence: 0,
         reason: "LLM did not return valid JSON",
       } satisfies HarnessRouteResponse);
       return;
     }
 
-    let parsed: any;
-    try {
-      parsed = JSON.parse(jsonMatch[0]);
-    } catch {
-      res.json({
-        type: "answer",
-        repoId,
-        answer: text,
-        confidence: 0,
-        reason: "LLM returned unparseable JSON",
-      } satisfies HarnessRouteResponse);
-      return;
-    }
-
-    const suggestions = buildTopSuggestionsFromParsed(parsed, prompt, workflowNames);
+    let suggestions = buildTopSuggestionsFromParsed(parsed as any, prompt, workflowNames);
     const workflow = typeof parsed.workflow === "string" ? parsed.workflow : "ask";
     const confidence = typeof parsed.confidence === "number" ? parsed.confidence : 0;
     const reason = typeof parsed.reason === "string" ? parsed.reason : "";
 
-    if (suggestions.length === 0) {
-      res.json({
-        type: "answer",
-        repoId,
-        answer:
-          reason || "I'm not sure what to do with that. Could you be more specific?",
-        confidence,
-        reason: !workflowNames.has(workflow)
-          ? `LLM picked unknown workflow "${workflow}"`
-          : "Low confidence",
-      } satisfies HarnessRouteResponse);
-      return;
+    let mapped = mapUnifiedParsedToHarnessResponse({
+      parsed,
+      prompt,
+      suggestionsBuilt: suggestions,
+      workflowNames,
+      allWorkflowNames,
+      repoId,
+      confidenceFallback: confidence,
+      reasonFallback: reason,
+      wfNameParsed: workflow,
+      dryRunSuggestionsEmptyFallThrough: false,
+    });
+
+    const emptyAnswer = (m: typeof mapped) =>
+      m &&
+      m.type === "answer" &&
+      !(m.answer ?? "").trim() &&
+      !m.prdThreadMatch;
+
+    const emptyClarify = (m: typeof mapped) =>
+      m && m.type === "clarify" && !(m.question ?? "").trim();
+
+    if (!mapped || emptyAnswer(mapped) || emptyClarify(mapped)) {
+      text = await runUnified(
+        "Your previous JSON was incomplete. Respond again with valid JSON only: " +
+          "for intent question include a non-empty answer that addresses the user's exact question; " +
+          "for ambiguous include a non-empty clarifyingQuestion that quotes or paraphrases their words; " +
+          "for action include at least one suggestion with confidence 0.6+ when a workflow applies."
+      );
+      const parsed2 = extractJsonObject(text);
+      if (parsed2) {
+        parsed = parsed2;
+        suggestions = buildTopSuggestionsFromParsed(parsed as any, prompt, workflowNames);
+        mapped = mapUnifiedParsedToHarnessResponse({
+          parsed,
+          prompt,
+          suggestionsBuilt: suggestions,
+          workflowNames,
+          allWorkflowNames,
+          repoId,
+          confidenceFallback:
+            typeof parsed.confidence === "number" ? parsed.confidence : 0,
+          reasonFallback: typeof parsed.reason === "string" ? parsed.reason : "",
+          wfNameParsed: typeof parsed.workflow === "string" ? parsed.workflow : "ask",
+          dryRunSuggestionsEmptyFallThrough: false,
+        });
+      }
     }
 
-    const primary = suggestions[0];
-    const selectedNames = suggestions.map((s) => s.workflow);
-    res.json({
-      type: "proposal",
-      repoId,
-      workflow: primary.workflow,
-      inputs: primary.inputs,
-      suggestions,
-      alternatives: proposalAlternativesExcluding(workflows, selectedNames),
-      confidence: primary.confidence,
-      reason: primary.reason,
-    } satisfies HarnessRouteResponse);
+    if (!mapped || emptyAnswer(mapped) || emptyClarify(mapped)) {
+      mapped = {
+        type: "answer",
+        repoId,
+        answer: [
+          `You asked: _${prompt}_`,
+          "",
+          "I couldn't generate a helpful reply this time. Try adding more detail, or name the repo workflow you want (e.g. fix bug, run tests, code review).",
+        ].join("\n"),
+        confidence: 0,
+        reason: "Empty LLM fields after retry",
+      };
+    }
+
+    res.json(mapped satisfies HarnessRouteResponse);
   } catch (err: any) {
     const msg = err?.message ?? String(err);
     console.error("[harness/route]", msg, err);
@@ -547,6 +713,13 @@ harnessRoutes.post("/harness/execute", async (req: Request, res: Response) => {
       mergedInputs.test_command = "npm install --legacy-peer-deps && npm run test";
     }
 
+    if (!(mergedInputs.branch ?? "").trim()) {
+      const hint = extractBranchHint(prompt ?? "", repoId);
+      if (hint && workflowDeclaresBranchInput(workflow)) {
+        mergedInputs.branch = hint;
+      }
+    }
+
     const missing = workflow.inputs
       .filter((inp) => inp.required && !(mergedInputs[inp.id] ?? "").trim())
       .map((inp) => inp.id);
@@ -560,13 +733,20 @@ harnessRoutes.post("/harness/execute", async (req: Request, res: Response) => {
     }
 
     const config = loadConfig();
+    const resolvedBranch = resolveCheckoutBaseBranch(
+      workflow,
+      mergedInputs,
+      baseBranch,
+      prompt ?? "",
+      repoId
+    );
     const runId = await startRun(
       repo,
       workflow,
       runPrompt || (prompt ?? ""),
       mergedInputs,
       config,
-      baseBranch
+      resolvedBranch
     );
 
     // Audit log

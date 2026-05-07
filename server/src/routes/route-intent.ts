@@ -152,7 +152,7 @@ routeIntentRoutes.post("/route-intent", async (req: Request, res: Response) => {
     });
     const harnessData = await harnessRes.json() as any;
 
-    if (harnessData.type === "proposal") {
+    if (harnessData.type === "proposal" || harnessData.type === "answer_with_proposal") {
       res.json({
         repoId: harnessData.repoId,
         workflow: harnessData.workflow,

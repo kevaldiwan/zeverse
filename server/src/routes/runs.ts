@@ -2,6 +2,7 @@ import { Router, Request, Response } from "express";
 import { loadConfig } from "../config";
 import { findWorkflow } from "../workflows";
 import type { WorkflowInput } from "../workflows";
+import { extractBranchHint, resolveCheckoutBaseBranch } from "../branch-hint";
 import { requireRepo } from "../repos";
 import { startRun, getActiveRun, resolveApproval, rejectApproval, resolveThreadReply } from "../runner";
 import { findStateByRunId, loadState, readLog, readEvents, appendEvent } from "../runner/state";
@@ -24,6 +25,7 @@ const INPUT_EXTRACTORS: Record<string, (text: string) => string | undefined> = {
   pr: (t) =>
     t.match(/https?:\/\/github\.com\/[^/\s]+\/[^/\s]+\/pull\/\d+[^\s)<>]*/i)?.[0] ??
     t.match(/(?:^|\s)#(\d+)(?:\s|$)/)?.[1],
+  branch: (t) => extractBranchHint(t),
 };
 
 function autofillInputs(
@@ -76,7 +78,14 @@ runRoutes.post("/run-workflow", async (req: Request, res: Response) => {
       mergedInputs.test_command = "npm install --legacy-peer-deps && npm run test";
     }
 
-    const runId = await startRun(repo, workflow, prompt ?? "", mergedInputs, config, baseBranch);
+    const resolvedBranch = resolveCheckoutBaseBranch(
+      workflow,
+      mergedInputs,
+      baseBranch,
+      prompt ?? "",
+      repo.id
+    );
+    const runId = await startRun(repo, workflow, prompt ?? "", mergedInputs, config, resolvedBranch);
     res.json({ runId, repoId: repo.id });
   } catch (err: any) {
     res.status(500).json({ error: err.message });

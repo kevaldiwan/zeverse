@@ -15,10 +15,16 @@ import fs from "fs";
 
 import { App, LogLevel } from "@slack/bolt";
 import {
-  bulletsToNumberedLines,
-  normalizeSlackMrkdwn,
+  formatLLMTextForSlack,
+  sanitizeForSlackMrkdwn,
   wrapWorkflowSummary,
 } from "./format-slack-message";
+import {
+  extractJestSummary,
+  findStepOutputWithJestSummary,
+  formatJestStatusHeader,
+  jestSummaryHasFailures,
+} from "./jest-summary";
 
 const ZEVERSE_SERVER_URL = process.env.ZEVERSE_SERVER_URL ?? "http://localhost:3100";
 const ZEVERSE_UI_URL = process.env.ZEVERSE_UI_URL ?? "http://localhost:5173";
@@ -435,7 +441,7 @@ async function isRepoAdmin(
       allowed: false,
       reason:
         "`ZEVERSE_REPO_ADMIN_USER_IDS` is not configured. " +
-        "Set it in the **repo root** `.env` as a comma-separated list of Slack user IDs, then restart the Slack bot process.",
+        "Set it in the *repo root* `.env` as a comma-separated list of Slack user IDs, then restart the Slack bot process.",
     };
   }
   if (!admins.has(slackUser)) {
@@ -715,6 +721,10 @@ interface RunState {
   workflow?: string;
   status: string;
   steps: { id: string; status: string; output: string; error?: string }[];
+  /** Git base branch used for the clone (when set on the run). */
+  baseBranch?: string;
+  /** Isolation / run branch when using branch workflow isolation. */
+  branch?: string;
   /** Present when the run failed due to gate rules (no step may be marked `failed`). */
   gateFailures?: { stepId: string; error: string }[];
 }
@@ -732,25 +742,32 @@ async function formatRunFailureForSlack(
 ): Promise<string> {
   const failedStep = state.steps.find((s) => s.status === "failed");
   const hubLink = `<${ZEVERSE_UI_URL}/?run=${runId}|View run details>`;
+  const branchNote = (state.baseBranch ?? state.branch ?? "").trim();
+  const branchLine = branchNote ? `Branch: \`${branchNote}\`` : "";
 
   if (failedStep) {
+    const errMsg = sanitizeForSlackMrkdwn((failedStep.error ?? "unknown").trim());
     return [
       `*${title}*`,
+      branchLine,
       `Step: \`${failedStep.id}\``,
-      `Error: ${failedStep.error ?? "unknown"}`,
+      `Error: ${errMsg}`,
       hubLink,
-    ].join("\n");
+    ]
+      .filter(Boolean)
+      .join("\n");
   }
 
   const lines: string[] = [`*${title}*`];
+  if (branchLine) lines.push(branchLine);
   if (state.gateFailures && state.gateFailures.length > 0) {
     lines.push("*Gate check:*", "");
     state.gateFailures.forEach((g, i) => {
-      lines.push(`${i + 1}. \`${g.stepId}\`: ${g.error}`);
+      lines.push(`${i + 1}. \`${g.stepId}\`: ${sanitizeForSlackMrkdwn((g.error ?? "").trim())}`);
     });
   } else {
     lines.push(
-      "_No step-level error on record._ Common causes: **LLM init** (check `config/zeverse.yaml` and env), **git isolation** (uncommitted changes on the server’s repo copy), or **branch creation** failed. *Log tail* or the Zeverse run view has the line that explains it."
+      "_No step-level error on record._ Common causes: *LLM init* (check `config/zeverse.yaml` and env), *git isolation* (uncommitted changes on the server’s repo copy), or *branch creation* failed. *Log tail* or the Zeverse run view has the line that explains it."
     );
   }
 
@@ -785,6 +802,8 @@ function extractFrAnalysisSummaryForSlack(text: string): string | null {
 }
 
 const SLACK_MAX_TEXT = 3900;
+/** Slack `section` mrkdwn fields are capped smaller than our plain `text` fallback. */
+const SLACK_SECTION_MRDKWN_MAX = 2900;
 
 /** Friendlier thread headers when a run finishes (fallback: “Workflow complete”). */
 const WORKFLOW_SLACK_LABELS: Record<string, string> = {
@@ -792,11 +811,20 @@ const WORKFLOW_SLACK_LABELS: Record<string, string> = {
   "prd-analysis": "Done — PRD analysis",
   dev: "Done — dev workflow",
   "pr-review": "Done — PR review",
+  test: "Done — test run",
 };
 
 function trimOutput(text: string): string {
   if (text.length <= SLACK_MAX_TEXT) return text;
   return text.slice(0, SLACK_MAX_TEXT) + "\n…_(truncated — see full output in Zeverse)_";
+}
+
+function trimSlackMrkdwnSection(text: string, max = SLACK_SECTION_MRDKWN_MAX): string {
+  if (text.length <= max) return text;
+  return (
+    text.slice(0, max - 55).trimEnd() +
+    "\n…_(truncated — open thread fallback or Zeverse for full text)_"
+  );
 }
 
 async function pollRunAndPostResult(
@@ -831,8 +859,16 @@ async function pollRunAndPostResult(
       return;
     }
 
+    const checkoutBranchForRun = (state.baseBranch ?? state.branch ?? "").trim();
+
     const wfName = state.workflow ?? "";
     const doneTitle = WORKFLOW_SLACK_LABELS[wfName] ?? "Workflow complete";
+    const jestRawForTest =
+      wfName === "test" ? findStepOutputWithJestSummary(state.steps) : null;
+    const jestParsedForTest =
+      wfName === "test"
+        ? extractJestSummary(jestRawForTest ?? "")
+        : extractJestSummary("");
     const sectionParts: string[] = [];
 
     const diffStep = state.steps.find((s) => s.id === "diff-after");
@@ -856,7 +892,10 @@ async function pollRunAndPostResult(
     const reviewStep = state.steps.find((s) => s.id === "review");
     if (reviewStep?.output) {
       const verdictMatch = reviewStep.output.match(/(?:verdict|recommendation)[:\s]*(.*)/i);
-      if (verdictMatch) sectionParts.push(`*Review verdict:* ${verdictMatch[1].trim().slice(0, 200)}`);
+      if (verdictMatch) {
+        const v = sanitizeForSlackMrkdwn(verdictMatch[1].trim().slice(0, 200));
+        sectionParts.push(`*Review verdict:* ${v}`);
+      }
     }
 
     const hasDiffPrReview =
@@ -866,12 +905,24 @@ async function pollRunAndPostResult(
         const analyse = state.steps.find((s) => s.id === "analyse");
         const raw = analyse?.output ?? "";
         const summary = extractFrAnalysisSummaryForSlack(raw);
-        const formatted = normalizeSlackMrkdwn(bulletsToNumberedLines(summary ?? raw));
+        const formatted = formatLLMTextForSlack(summary ?? raw);
         sectionParts.push(formatted);
       } else {
         const lastStep = state.steps[state.steps.length - 1];
         const lastOutput = lastStep?.output ?? "";
-        sectionParts.push(normalizeSlackMrkdwn(bulletsToNumberedLines(lastOutput)));
+        let formatted = formatLLMTextForSlack(lastOutput);
+        if (wfName === "test" || wfName === "test-fix") {
+          const branchLine = checkoutBranchForRun
+            ? `*Branch:* \`${checkoutBranchForRun}\``
+            : "";
+          if (wfName === "test") {
+            const header = formatJestStatusHeader(state.status, jestParsedForTest);
+            formatted = [branchLine, header, formatted].filter(Boolean).join("\n\n");
+          } else {
+            formatted = [branchLine, formatted].filter(Boolean).join("\n\n");
+          }
+        }
+        sectionParts.push(formatted);
       }
     }
 
@@ -884,11 +935,42 @@ async function pollRunAndPostResult(
       footer,
     });
 
-    await client.chat.postMessage({
-      channel,
-      thread_ts,
-      text,
-    });
+    const showFixButton =
+      wfName === "test" && jestSummaryHasFailures(jestParsedForTest);
+
+    if (showFixButton) {
+      await client.chat.postMessage({
+        channel,
+        thread_ts,
+        text,
+        blocks: [
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: trimSlackMrkdwnSection(text),
+            },
+          },
+          {
+            type: "actions",
+            elements: [
+              {
+                type: "button",
+                text: { type: "plain_text", text: "Fix failing tests" },
+                action_id: "test_run_fix_failing",
+                value: `${repoId}:${runId}`,
+              },
+            ],
+          },
+        ],
+      });
+    } else {
+      await client.chat.postMessage({
+        channel,
+        thread_ts,
+        text,
+      });
+    }
     return;
   }
 
@@ -901,20 +983,27 @@ async function pollRunAndPostResult(
   });
 }
 
-function successBlocks(inv: Invocation & { runId: string }) {
+function successBlocks(
+  inv: Invocation & { runId: string },
+  opts?: { branchLine?: string }
+): any[] {
+  const core = [
+    `*Zeverse workflow started*`,
+    `Repo: \`${inv.repoId}\``,
+    `Workflow: \`${inv.workflow}\``,
+  ];
+  if (opts?.branchLine?.trim()) core.push(opts.branchLine.trim());
+  core.push(
+    `Prompt: ${inv.prompt}`,
+    `Run ID: \`${inv.runId}\``,
+    `<${ZEVERSE_UI_URL}/?run=${inv.runId}|View in Zeverse>`
+  );
   return [
     {
       type: "section",
       text: {
         type: "mrkdwn",
-        text: [
-          `*Zeverse workflow started*`,
-          `Repo: \`${inv.repoId}\``,
-          `Workflow: \`${inv.workflow}\``,
-          `Prompt: ${inv.prompt}`,
-          `Run ID: \`${inv.runId}\``,
-          `<${ZEVERSE_UI_URL}/?run=${inv.runId}|View in Zeverse>`,
-        ].join("\n"),
+        text: core.join("\n"),
       },
     },
   ];
@@ -1315,10 +1404,10 @@ async function pollRunAndReply(
       : "";
 
     const slackReplyFmt = slackReply
-      ? normalizeSlackMrkdwn(bulletsToNumberedLines(slackReply))
+      ? formatLLMTextForSlack(slackReply)
       : "_No verdict produced — check the full run._";
     const epicFmt = epicBreakdown
-      ? normalizeSlackMrkdwn(bulletsToNumberedLines(epicBreakdown))
+      ? formatLLMTextForSlack(epicBreakdown)
       : "";
 
     const body = [
@@ -1343,16 +1432,17 @@ async function pollRunAndReply(
       const gdocLink = q.commentId
         ? `<https://docs.google.com/document/d/${docId}/edit?disco=${q.commentId}|View in GDoc>`
         : "";
+      const qBodyFmt = sanitizeForSlackMrkdwn(q.body);
       await client.chat.postMessage({
         channel,
         thread_ts,
-        text: `[Q${q.index}] ${q.body}`,
+        text: `[Q${q.index}] ${qBodyFmt}`,
         blocks: [
           {
             type: "section",
             text: {
               type: "mrkdwn",
-              text: `*[Q${q.index}]* ${q.body}${gdocLink ? `\n${gdocLink}` : ""}`,
+              text: `*[Q${q.index}]* ${qBodyFmt}${gdocLink ? `\n${gdocLink}` : ""}`,
             },
           },
           {
@@ -1807,6 +1897,10 @@ async function pollThreadSync(
     if (repliesPosted === 0 && repliesFailed === 0 && !(intent === "update" && edits.length > 0)) {
       parts.push("_No comment replies were posted (see the Zeverse run for details)._");
     }
+    if (summary?.trim()) {
+      parts.push("");
+      parts.push(formatLLMTextForSlack(summary));
+    }
     parts.push("");
     parts.push(`<${ctx.docUrl}|Open PRD in Google Docs>`);
     parts.push(`<${ZEVERSE_UI_URL}/?run=${runId}|View full run in Zeverse>`);
@@ -1857,7 +1951,7 @@ function buildGenericThreadContext(messages: any[]): string {
 // ─── Harness route + execute callers ────────────────────────────────────────
 
 interface HarnessRouteResult {
-  type: "proposal" | "answer" | "clarify";
+  type: "proposal" | "answer" | "answer_with_proposal" | "clarify";
   repoId: string | null;
   workflow?: string;
   inputs?: Record<string, string>;
@@ -1872,20 +1966,41 @@ interface HarnessRouteResult {
   reason: string;
   answer?: string;
   question?: string;
+  clarifyingQuestion?: string;
   missing?: string[];
+  prdThreadMatch?: {
+    queryIndex: number | null;
+    suggestion: string | null;
+    conversationalReply?: string;
+    noMatchExplanation?: string;
+  };
   /** Populated on some error responses (e.g. HTTP 500 from harness/route). */
   error?: string;
+}
+
+function formatHarnessAnswerForSlack(raw: string): string {
+  const body = formatLLMTextForSlack(raw);
+  const paragraphs = raw.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  if (paragraphs.length >= 2) {
+    return wrapWorkflowSummary({
+      title: "Here's what I found",
+      body,
+    });
+  }
+  return body;
 }
 
 async function callHarnessRoute(
   prompt: string,
   threadContext: string,
   repoId: string | null,
-  surface: string
+  surface: string,
+  extras?: { prdQueries?: { index: number; body: string }[] }
 ): Promise<HarnessRouteResult> {
   const body: Record<string, any> = { prompt, surface };
   if (threadContext) body.threadContext = threadContext;
   if (repoId) body.repoId = repoId;
+  if (extras?.prdQueries?.length) body.prdQueries = extras.prdQueries;
 
   const res = await fetch(`${ZEVERSE_SERVER_URL}/api/harness/route`, {
     method: "POST",
@@ -1928,16 +2043,39 @@ async function callHarnessExecute(
 }
 
 /**
- * Extract `branch=<name>` from a Slack message and return the cleaned prompt
- * plus the extracted branch name (if any).
+ * Extract branch targeting from a Slack message (aligned with server extractBranchHint)
+ * and return the cleaned prompt plus optional HTTP baseBranch for execute.
  */
 function extractBranchFlag(text: string): { prompt: string; baseBranch?: string } {
-  const m = text.match(/\bbranch=(\S+)/i);
-  if (!m) return { prompt: text };
-  return {
-    prompt: text.replace(m[0], "").trim(),
-    baseBranch: m[1],
-  };
+  const eq = text.match(/\bbranch=(\S+)/i);
+  if (eq) {
+    return {
+      prompt: text.replace(eq[0], "").trim(),
+      baseBranch: eq[1],
+    };
+  }
+  const branchWord = text.match(/\bbranch\s+([\w./-]+)\b/i);
+  if (branchWord) {
+    return {
+      prompt: text.replace(branchWord[0], "").trim(),
+      baseBranch: branchWord[1],
+    };
+  }
+  const onBranch = text.match(/\bon\s+(?:the\s+)?branch\s+([\w./-]+)\b/i);
+  if (onBranch) {
+    return {
+      prompt: text.replace(onBranch[0], "").trim(),
+      baseBranch: onBranch[1],
+    };
+  }
+  const onWordBranch = text.match(/\bon\s+([\w./-]+)\s+branch\b/i);
+  if (onWordBranch) {
+    return {
+      prompt: text.replace(onWordBranch[0], "").trim(),
+      baseBranch: onWordBranch[1],
+    };
+  }
+  return { prompt: text };
 }
 
 // ─── Proposal store (avoid Slack value 2KB limit) ───────────────────────────
@@ -1964,6 +2102,12 @@ let proposalCounter = 0;
 
 function storeProposal(p: StoredProposal): string {
   const id = `p-${++proposalCounter}-${Date.now()}`;
+  if (
+    (p.workflow === "test" || p.workflow === "test-fix") &&
+    p.baseBranch?.trim()
+  ) {
+    p.inputs = { ...p.inputs, branch: p.baseBranch.trim() };
+  }
   proposalStore.set(id, p);
   setTimeout(() => proposalStore.delete(id), 10 * 60 * 1000);
   return id;
@@ -1983,13 +2127,49 @@ interface WorkflowCatalogEntry {
   inputs: { id: string; label: string; required?: boolean }[];
 }
 
-async function fetchReposDetailed(): Promise<{ id: string; name: string }[]> {
+async function fetchReposDetailed(): Promise<
+  { id: string; name: string; defaultBranch: string }[]
+> {
   const res = await fetch(`${ZEVERSE_SERVER_URL}/api/repos`);
-  const data = await zeverseResponseJson<{ repos: { id: string; name: string }[] }>(
-    res,
-    "GET /api/repos"
-  );
-  return data.repos ?? [];
+  const data = await zeverseResponseJson<{
+    repos: { id: string; name: string; defaultBranch?: string }[];
+  }>(res, "GET /api/repos");
+  return (data.repos ?? []).map((r) => ({
+    id: r.id,
+    name: r.name,
+    defaultBranch: (r.defaultBranch ?? "").trim() || "main",
+  }));
+}
+
+/** Slack mrkdwn: explicit chosen branch vs repo default (for test / test-fix proposals). */
+function proposalBranchMrkdwn(
+  p: StoredProposal,
+  repoDefaultBranches: Record<string, string>
+): string {
+  const chosen = p.inputs.branch?.trim() || p.baseBranch?.trim();
+  const db = repoDefaultBranches[p.repoId]?.trim();
+  if (chosen) {
+    return `*Chosen branch:* \`${chosen}\``;
+  }
+  if (db) {
+    return `*Branch:* \`${db}\` _(repo default — override with \`branch=<name>\`)_`;
+  }
+  return `*Branch:* _repo default — add \`branch=<name>\` to your message to pin a branch_`;
+}
+
+/** Line for “workflow started” card: chosen branch or resolved repo default for test workflows. */
+async function branchLineForWorkflowStart(p: StoredProposal): Promise<string | undefined> {
+  const explicit = p.inputs.branch?.trim() || p.baseBranch?.trim();
+  if (explicit) return `*Chosen branch:* \`${explicit}\``;
+  if (p.workflow !== "test" && p.workflow !== "test-fix") return undefined;
+  try {
+    const repos = await fetchReposDetailed();
+    const db = repos.find((r) => r.id === p.repoId)?.defaultBranch?.trim();
+    if (db) return `*Branch:* \`${db}\` _(repo default)_`;
+  } catch {
+    /* best-effort */
+  }
+  return `*Branch:* _repo default_`;
 }
 
 async function fetchWorkflowsCatalog(repoId: string): Promise<WorkflowCatalogEntry[]> {
@@ -2124,7 +2304,10 @@ function deletePrdPrProposal(id: string): void {
 
 // ─── Block Kit confirm UI ───────────────────────────────────────────────────
 
-function proposalBlocks(runProposalIds: string[]): any[] {
+function proposalBlocks(
+  runProposalIds: string[],
+  repoDefaultBranches: Record<string, string> = {}
+): any[] {
   const resolved = runProposalIds
     .map((id) => ({ id, p: proposalStore.get(id) }))
     .filter((x): x is { id: string; p: StoredProposal } => !!x.p);
@@ -2205,6 +2388,16 @@ function proposalBlocks(runProposalIds: string[]): any[] {
     altLines,
     "\n_Use a *Run* button to start that workflow, *Help* for the full catalog, or *Pick another…*_"
   );
+
+  const branchWorkflowIdx = resolved.findIndex(
+    (x) => x.p.workflow === "test" || x.p.workflow === "test-fix"
+  );
+  if (branchWorkflowIdx >= 0) {
+    pickLines.push(
+      "",
+      proposalBranchMrkdwn(resolved[branchWorkflowIdx].p, repoDefaultBranches)
+    );
+  }
 
   const runButtons = resolved.slice(0, 3).map(({ id, p }, i) => {
     const wfShort =
@@ -2437,7 +2630,8 @@ async function pollRunEvents(
         try { ev = JSON.parse(line); } catch { continue; }
 
         if (ev.type === "awaiting_approval" && ev.stepId) {
-          const approvalMsg = ev.prompt ?? "Approval required to continue this workflow.";
+          const approvalMsgRaw = ev.prompt ?? "Approval required to continue this workflow.";
+          const approvalMsg = sanitizeForSlackMrkdwn(approvalMsgRaw);
           await client.chat.postMessage({
             channel,
             thread_ts,
@@ -2474,7 +2668,9 @@ async function pollRunEvents(
         }
 
         if (ev.type === "awaiting_thread_reply" && ev.stepId) {
-          const askMsg = ev.prompt ?? "Please reply in this thread with the requested information.";
+          const askMsg = sanitizeForSlackMrkdwn(
+            ev.prompt ?? "Please reply in this thread with the requested information."
+          );
           await client.chat.postMessage({
             channel,
             thread_ts,
@@ -2552,31 +2748,113 @@ async function handleHarnessMessage(
     if (route.error && !raw.includes(route.error)) {
       raw = `${raw}\n\n_${route.error}_`;
     }
-    const text = wrapWorkflowSummary({
-      title: "Here’s what I found",
-      body: normalizeSlackMrkdwn(bulletsToNumberedLines(raw)),
-    });
+    const text = formatHarnessAnswerForSlack(raw);
     await client.chat.postMessage({ channel, thread_ts, text });
     return;
   }
 
   if (route.type === "clarify") {
-    const raw = route.question ?? "Could you provide more details?";
-    const text = wrapWorkflowSummary({
-      title: "Quick question",
-      body: normalizeSlackMrkdwn(bulletsToNumberedLines(raw)),
+    const raw =
+      (route.clarifyingQuestion ?? route.question)?.trim() ||
+      "Could you provide more details?";
+    const bodyOnly = formatLLMTextForSlack(raw);
+    await client.chat.postMessage({ channel, thread_ts, text: bodyOnly });
+    return;
+  }
+
+  let repoDefaultBranches: Record<string, string> = {};
+  if (route.type === "answer_with_proposal" || route.type === "proposal") {
+    try {
+      const repos = await fetchReposDetailed();
+      repoDefaultBranches = Object.fromEntries(
+        repos.map((r) => [r.id, r.defaultBranch])
+      );
+    } catch {
+      repoDefaultBranches = {};
+    }
+  }
+
+  if (route.type === "answer_with_proposal") {
+    let raw = route.answer ?? "";
+    if (route.error && raw && !raw.includes(route.error)) {
+      raw = `${raw}\n\n_${route.error}_`;
+    }
+    const repoIdProposal = route.repoId;
+    if (!repoIdProposal) {
+      const fallback = raw.trim()
+        ? formatLLMTextForSlack(raw)
+        : await noRepoErrorText("@ZeverseBot");
+      await client.chat.postMessage({
+        channel,
+        thread_ts,
+        text: fallback,
+      });
+      return;
+    }
+    const summaryText =
+      raw.trim().length > 0
+        ? formatHarnessAnswerForSlack(raw)
+        : `_${sanitizeForSlackMrkdwn(route.reason || "Suggested workflow — tap *Run* when you’re ready.")}_`;
+
+    const suggestionsAp =
+      route.suggestions && route.suggestions.length > 0
+        ? route.suggestions
+        : [
+            {
+              workflow: route.workflow ?? DEFAULT_WORKFLOW,
+              inputs: route.inputs ?? { requirement: prompt },
+              confidence: route.confidence,
+              reason: route.reason,
+            },
+          ];
+    const alternativesAp = route.alternatives ?? [];
+    const idsAp = suggestionsAp.map((s) =>
+      storeProposal({
+        repoId: repoIdProposal,
+        workflow: s.workflow,
+        inputs: s.inputs,
+        alternatives: alternativesAp,
+        prompt,
+        confidence: s.confidence,
+        reason: s.reason,
+        channel,
+        threadTs: thread_ts,
+        baseBranch,
+        threadContext: threadContext.trim() ? threadContext : undefined,
+      })
+    );
+    for (const id of idsAp) {
+      const pr = proposalStore.get(id)!;
+      pr.relatedProposalIds = [...idsAp];
+    }
+    const primaryAp = suggestionsAp[0];
+    await client.chat.postMessage({
+      channel,
+      thread_ts,
+      blocks: [
+        {
+          type: "section",
+          text: { type: "mrkdwn", text: summaryText },
+        },
+        ...proposalBlocks(idsAp, repoDefaultBranches),
+      ],
+      text:
+        summaryText +
+        `\n\nOptional workflow: *${primaryAp.workflow}* on \`${repoIdProposal}\`.`,
     });
-    await client.chat.postMessage({ channel, thread_ts, text });
     return;
   }
 
   const repoId = route.repoId;
 
   if (!repoId) {
+    const q = route.question
+      ? sanitizeForSlackMrkdwn(route.question)
+      : "Which repository should I work with? " + (await noRepoErrorText("@ZeverseBot"));
     await client.chat.postMessage({
       channel,
       thread_ts,
-      text: route.question ?? "Which repository should I work with? " + (await noRepoErrorText("@ZeverseBot")),
+      text: q,
     });
     return;
   }
@@ -2619,7 +2897,7 @@ async function handleHarnessMessage(
   await client.chat.postMessage({
     channel,
     thread_ts,
-    blocks: proposalBlocks(ids),
+    blocks: proposalBlocks(ids, repoDefaultBranches),
     text:
       suggestions.length > 1
         ? `I’m proposing ${suggestions.length} workflows on \`${repoId}\`. Tap *Run* on the best match.`
@@ -2697,10 +2975,14 @@ app.action("harness_run", async ({ action, ack, body, client, logger }) => {
         (err) => logger.error("pollRunAndReply (harness_run prd) error:", err)
       );
     } else {
+      const branchLine = await branchLineForWorkflowStart(p);
       await client.chat.postMessage({
         channel,
         thread_ts,
-        blocks: successBlocks({ repoId: p.repoId, workflow: p.workflow, prompt: p.prompt, runId }),
+        blocks: successBlocks(
+          { repoId: p.repoId, workflow: p.workflow, prompt: p.prompt, runId },
+          { branchLine }
+        ),
         text: `Zeverse run ${runId} started for ${p.repoId}/${p.workflow}`,
       });
       pollRunAndPostResult(runId, p.repoId, channel, thread_ts, client, logger).catch(
@@ -2805,10 +3087,14 @@ app.action("harness_pick", async ({ action, ack, body, client, logger }) => {
         (err) => logger.error("pollRunAndReply (harness_pick prd) error:", err)
       );
     } else {
+      const branchLine = await branchLineForWorkflowStart(p);
       await client.chat.postMessage({
         channel,
         thread_ts: p.threadTs,
-        blocks: successBlocks({ repoId: p.repoId, workflow: newWorkflow, prompt: p.prompt, runId }),
+        blocks: successBlocks(
+          { repoId: p.repoId, workflow: newWorkflow, prompt: p.prompt, runId },
+          { branchLine }
+        ),
         text: `Zeverse run ${runId} started for ${p.repoId}/${newWorkflow}`,
       });
       pollRunAndPostResult(runId, p.repoId, channel, p.threadTs, client, logger).catch(
@@ -2836,6 +3122,84 @@ app.action("harness_pick", async ({ action, ack, body, client, logger }) => {
   }
   deleteProposalGroup(proposalId);
 });
+
+// ─── Test workflow: start test-fix from thread ───────────────────────────────
+app.action("test_run_fix_failing", async ({ ack, body, client, logger }) => {
+  await ack();
+  const rawVal = String((body as any).actions?.[0]?.value ?? "").trim();
+  const sep = rawVal.indexOf(":");
+  const channel = (body as any).channel?.id;
+  const thread_ts =
+    (body as any).message?.thread_ts ?? (body as any).message?.ts;
+  const slackUser = (body as any).user?.id;
+  if (sep === -1 || !channel || !thread_ts || !slackUser) return;
+
+  const repoId = rawVal.slice(0, sep).trim();
+  const priorRunId = rawVal.slice(sep + 1).trim();
+  if (!repoId || !priorRunId) return;
+
+  const messages = await fetchThreadMessages(channel, thread_ts, client);
+  const threadBits = [
+    `Follow-up from test workflow run \`${priorRunId}\`: fix failing tests.`,
+    buildGenericThreadContext(messages),
+  ].filter(Boolean);
+  const threadContext = threadBits.join("\n\n");
+
+  const prompt = `Fix failing tests (after test run ${priorRunId})`;
+
+  try {
+    const result = await callHarnessExecute(repoId, "test-fix", {}, prompt, {
+      slackUser,
+      channel,
+      surface: "slack",
+      threadContext: threadContext || undefined,
+    });
+    const errMsg = result.error?.trim();
+    if (errMsg || !result.runId) {
+      const notFound = !result.runId || /not found|404/i.test(errMsg ?? "");
+      const friendly = notFound
+        ? `Could not start *test-fix* for \`${repoId}\`. Add a \`test-fix\` workflow under \`.zeverse/workflows/\` in that repo (copy from the Zeverse hub if needed), then refresh workflows.${errMsg ? `\n_${errMsg}_` : ""}`
+        : `Failed to start test-fix: ${errMsg}`;
+      await client.chat.postMessage({ channel, thread_ts, text: friendly });
+      return;
+    }
+
+    const runId = result.runId;
+    const branchLine = await branchLineForWorkflowStart({
+      repoId,
+      workflow: "test-fix",
+      inputs: {},
+      alternatives: [],
+      prompt,
+      confidence: 1,
+      reason: "test-fix follow-up",
+      channel: channel ?? "",
+      threadTs: thread_ts ?? "",
+    } as StoredProposal);
+    await client.chat.postMessage({
+      channel,
+      thread_ts,
+      blocks: successBlocks(
+        { repoId, workflow: "test-fix", prompt, runId },
+        { branchLine }
+      ),
+      text: `Zeverse test-fix run ${runId} started for ${repoId}`,
+    });
+    pollRunAndPostResult(runId, repoId, channel, thread_ts, client, logger).catch((err) =>
+      logger.error("pollRunAndPostResult (test_run_fix_failing) error:", err)
+    );
+    pollRunEvents(runId, repoId, channel, thread_ts, client, logger).catch((err) =>
+      logger.error("pollRunEvents (test_run_fix_failing) error:", err)
+    );
+  } catch (err: any) {
+    await client.chat.postMessage({
+      channel,
+      thread_ts,
+      text: `Error starting test-fix: ${err.message}`,
+    });
+  }
+});
+
 // ─── Button action: Help (workflow catalog) ─────────────────────────────────
 app.action("harness_help", async ({ ack, action, body, client, logger }) => {
   await ack();
@@ -3153,7 +3517,8 @@ app.action("prd_create_fr_card", async ({ action, ack, body, client, logger }) =
     return;
   }
 
-  const preview = extractDeliverablePreview(deliverableContent);
+  const previewRaw = extractDeliverablePreview(deliverableContent);
+  const preview = sanitizeForSlackMrkdwn(previewRaw);
 
   try {
     await client.views.open({
@@ -3385,7 +3750,7 @@ async function pollFrCardAndReply(
         parts.push("");
         parts.push("*Failed:*");
         failures.forEach((f, i) => {
-          parts.push(`${i + 1}. ${f.kind} "${f.title}": ${f.reason}`);
+          parts.push(`${i + 1}. ${f.kind} "${f.title}": ${sanitizeForSlackMrkdwn(f.reason)}`);
         });
       }
     } else {
@@ -3393,7 +3758,7 @@ async function pollFrCardAndReply(
       const output = summaryStep?.output || createOutput || "Cards created (no summary available).";
       parts.push(`*Freshrelease cards created* — \`${repoId}\``);
       parts.push("");
-      parts.push(trimOutput(normalizeSlackMrkdwn(bulletsToNumberedLines(output))));
+      parts.push(trimOutput(formatLLMTextForSlack(output)));
     }
 
     parts.push("");
@@ -3700,12 +4065,6 @@ async function handleHarnessFollowUp(
   client: any,
   logger: any
 ): Promise<void> {
-  await client.chat.postMessage({
-    channel,
-    thread_ts,
-    text: `_Routing follow-up..._`,
-  });
-
   handleHarnessMessage(newPrompt, channel, thread_ts, client, logger, "mention", ctx.repoId).catch(
     (err) => logger.error("handleHarnessMessage (follow-up) error:", err)
   );
@@ -3784,54 +4143,18 @@ app.event("app_mention", async ({ event, client, logger }) => {
 // When a user replies in a tracked PRD-analysis Slack thread, match their
 // answer to an open query and post it as a reply on the Google Doc comment.
 
+type PrdReplyMatch =
+  | { queryIndex: number; suggestion: string }
+  | { conversational: string }
+  | { unresolved: string };
+
 async function matchReplyToQuery(
   userReply: string,
-  queries: PrdQueryInfo[]
-): Promise<{ queryIndex: number; suggestion: string } | null> {
-  const queriesList = queries
-    .map((q) => `Q${q.index}: ${q.body}`)
-    .join("\n");
-
-  const prompt = [
-    "You are matching a user's reply to one of several open PRD questions.",
-    "The user answered in a Slack thread. Determine which question they are",
-    "answering and produce a concise suggestion suitable for a Google Doc comment reply.",
-    "",
-    "Open questions:",
-    queriesList,
-    "",
-    "User reply:",
-    userReply,
-    "",
-    "Respond in EXACTLY this format (nothing else):",
-    "MATCH: <number>",
-    "SUGGESTION: <your concise suggestion>",
-    "",
-    "If the reply doesn't clearly answer any question, respond:",
-    "MATCH: 0",
-    "SUGGESTION: none",
-  ].join("\n");
-
-  try {
-    const res = await fetch(`${ZEVERSE_SERVER_URL}/api/run-workflow`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        repoId: queries[0]?.commentId ? "_llm_only" : "",
-        workflow: "_inline",
-        prompt,
-      }),
-    });
-    // The run-workflow endpoint won't work for an ad-hoc LLM call.
-    // Instead we call the LLM through a lightweight prompt via the
-    // existing triggerWorkflow + poll pattern... but that's heavy.
-    // Simpler: do the matching locally with heuristics, and fall back
-    // to posting the raw reply if no match is found.
-  } catch {
-    // fall through to heuristic
-  }
-
-  // Heuristic matching: check for "Q<n>" or "#<n>" prefix
+  queries: PrdQueryInfo[],
+  repoId: string,
+  threadContext: string
+): Promise<PrdReplyMatch> {
+  // Explicit prefix: highest precision
   const prefixMatch = userReply.match(/^(?:Q|#)\s*(\d+)\b/i);
   if (prefixMatch) {
     const idx = parseInt(prefixMatch[1], 10);
@@ -3842,32 +4165,52 @@ async function matchReplyToQuery(
     }
   }
 
-  // Keyword matching: find the query with the most overlapping words
-  const replyWords = new Set(userReply.toLowerCase().split(/\W+/).filter((w) => w.length > 3));
-  let bestIdx = 0;
-  let bestScore = 0;
-  for (const q of queries) {
-    const qWords = new Set(q.body.toLowerCase().split(/\W+/).filter((w) => w.length > 3));
-    let overlap = 0;
-    for (const w of replyWords) {
-      if (qWords.has(w)) overlap++;
+  try {
+    const route = await callHarnessRoute(
+      userReply,
+      threadContext,
+      repoId,
+      "prd_thread",
+      { prdQueries: queries.map((q) => ({ index: q.index, body: q.body })) }
+    );
+
+    if (route.error) {
+      return {
+        unresolved: `${route.error} (Couldn't reach the routing model.)`,
+      };
     }
-    if (overlap > bestScore) {
-      bestScore = overlap;
-      bestIdx = q.index;
+
+    const pm = route.prdThreadMatch;
+    const convo =
+      (route.answer ?? "").trim() ||
+      (pm?.conversationalReply ?? "").trim();
+
+    const idx =
+      pm && typeof pm.queryIndex === "number" && pm.queryIndex >= 1
+        ? pm.queryIndex
+        : null;
+    const sug = (pm?.suggestion ?? "").trim();
+
+    if (idx !== null && sug) {
+      return { queryIndex: idx, suggestion: sug };
     }
-  }
 
-  if (bestScore >= 2) {
-    return { queryIndex: bestIdx, suggestion: userReply.trim() };
-  }
+    if (convo) {
+      return { conversational: convo };
+    }
 
-  // If only one query, it's an obvious match
-  if (queries.length === 1) {
-    return { queryIndex: queries[0].index, suggestion: userReply.trim() };
+    return {
+      unresolved:
+        pm?.noMatchExplanation?.trim() ||
+        "I'm not sure which open question you're addressing.",
+    };
+  } catch (err: any) {
+    return {
+      unresolved: err?.message
+        ? `Routing failed: ${err.message}`
+        : "Couldn't classify your reply right now.",
+    };
   }
-
-  return null;
 }
 
 async function postGDocReply(
@@ -3911,16 +4254,34 @@ app.message(async ({ message, client, logger }) => {
   const text = (m.text ?? "").trim();
   if (!text) return;
 
-  const match = await matchReplyToQuery(text, ctx.queries);
-  if (!match) {
-    const queryList = ctx.queries.map((q) => `Q${q.index}: ${q.body.slice(0, 80)}`).join("\n");
+  const threadMsgs = await fetchThreadMessages(m.channel, m.thread_ts, client);
+  const prdThreadContext = buildGenericThreadContext(threadMsgs);
+
+  const match = await matchReplyToQuery(text, ctx.queries, ctx.repoId, prdThreadContext);
+
+  const queryList = ctx.queries
+    .map((q) => `Q${q.index}: ${sanitizeForSlackMrkdwn(q.body.slice(0, 120))}`)
+    .join("\n");
+
+  if ("conversational" in match) {
+    const body = formatLLMTextForSlack(match.conversational);
+    await client.chat.postMessage({
+      channel: m.channel,
+      thread_ts: m.thread_ts,
+      text: body,
+    });
+    return;
+  }
+
+  if ("unresolved" in match) {
+    const unresolvedFmt = sanitizeForSlackMrkdwn(match.unresolved);
     await client.chat.postMessage({
       channel: m.channel,
       thread_ts: m.thread_ts,
       text:
-        `I couldn't tell which question you're answering. ` +
-        `Prefix your reply with \`Q<number>\` to match it, e.g. \`Q1 yes, we should...\`\n\n` +
-        `Open questions:\n${queryList}`,
+        `${unresolvedFmt}\n\n` +
+        `Open questions:\n${queryList}\n\n` +
+        `If you're answering one of these, prefix with \`Q<number>\`, e.g. \`Q1 yes, we should…\`.`,
     });
     return;
   }
