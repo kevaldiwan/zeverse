@@ -8,6 +8,7 @@ export const smartReplyRoutes = Router();
 
 interface SmartReplyResponse {
   type: "answer" | "clarify" | "workflow";
+  /** Present when harness returned answer_with_proposal — conversational text before running workflow. */
   answer?: string;
   question?: string;
   missing?: string[];
@@ -39,6 +40,16 @@ smartReplyRoutes.post("/smart-reply", async (req: Request, res: Response) => {
         type: "workflow",
         workflow: data.workflow,
         inputs: data.inputs,
+        repoId: data.repoId,
+        confidence: data.confidence ?? 0,
+        reason: data.reason ?? "",
+      } satisfies SmartReplyResponse);
+    } else if (data.type === "answer_with_proposal") {
+      res.json({
+        type: "workflow",
+        workflow: data.workflow,
+        inputs: data.inputs,
+        answer: data.answer,
         repoId: data.repoId,
         confidence: data.confidence ?? 0,
         reason: data.reason ?? "",

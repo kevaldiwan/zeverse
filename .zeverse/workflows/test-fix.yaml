@@ -10,6 +10,9 @@ inputs:
     label: >-
       Test command (default for this hub is npm install --legacy-peer-deps && npm run test if omitted)
     required: false
+  - id: branch
+    label: Git branch to use (leave blank for repo default)
+    required: false
 isolation: branch
 steps:
   - id: setup

@@ -12,6 +12,9 @@ inputs:
   - id: pattern
     label: Test path pattern (e.g. src/pages/billing, leave blank for all)
     required: false
+  - id: branch
+    label: Git branch to run tests on (leave blank for repo default)
+    required: false
 steps:
   # ubx-ui needs --legacy-peer-deps. Try ci when a lockfile exists; fall back if it is out of sync with package.json.
   - id: install
@@ -41,14 +44,33 @@ steps:
 
       {{steps.jest.output}}
 
-      Produce:
-      1. PASS / FAIL summary (totals: suites, tests, time).
-      2. For each failing test:
+      Write Slack-friendly mrkdwn for teammates. Use `1.` `2.` `3.` for main sections and `*bold*` for small labels.
+
+      Wrap the primary summary so it is easy to slice later:
+
+      --- TEST SUMMARY ---
+      ...your structured summary here...
+      --- END TEST SUMMARY ---
+
+      Inside that block, output sections **in this exact order**:
+
+      1. **Workflow status** — Two lines:
+         - Whether the Zeverse workflow completed (tests command ran and summarisation ran).
+         - **Tests:** pass vs fail using the same counts as Jest’s summary lines (suites and tests).
+
+      2. **PASS / FAIL metrics** — A compact block in a fenced code fence (Slack does not render Markdown tables reliably). Include suites, tests, snapshots if present, and time from Jest output.
+
+      3. **Failing tests** — Only if any tests failed. For **each** failure include:
          - Test name and file path.
-         - One-line root cause (based on the stack + assertion).
-         - Concrete suggested fix (code, config, or test change).
-      3. Flaky / slow tests worth attention.
-      4. If everything passed, say so in one line.
+         - *Why it failed* (assertion / expectation vs stack).
+         - *Classification* — exactly one of: `production code bug`, `logic/behavior mismatch`, `test wrong or outdated`, `config/tooling/environment`, `flaky`.
+         - *What to change* — one concrete next step.
+
+      4. **Warnings worth addressing** — Console warnings, DOM/React warnings, MSW issues, etc., if visible in the output.
+
+      5. **Slow / flaky tests worth attention** — briefly, if any stand out.
+
+      If everything passed (no failed suites/tests), say so clearly in section 1 and keep sections 3–5 brief or omit when nothing applies.
 
 # After updating this file on GitHub, either wait ~60s for workflow cache TTL or:
 #   curl -X POST "http://127.0.0.1:3100/api/repos/ubx-ui/refresh-workflows"
