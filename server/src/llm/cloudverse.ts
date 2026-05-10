@@ -4,7 +4,7 @@ import type { LLMMessage, LLMProvider, LLMResponse } from "./types";
 
 /** If the key is a JWT, return a hint when `exp` is in the past */
 export function cloudVerseJwtExpiredHint(apiKey: string): string | undefined {
-  const key = apiKey.trim();
+  const key = apiKey?.trim();
   const parts = key.split(".");
   if (parts.length !== 3) return undefined;
 
@@ -22,7 +22,7 @@ export function cloudVerseJwtExpiredHint(apiKey: string): string | undefined {
 
     if (Date.now() <= expMs) return undefined;
 
-    return `API key JWT expired at ${new Date(expMs).toISOString()} — obtain a new CloudVerse key.`;
+    return `API key JWT expired at ${new Date(expMs).toISOString()}`;
   } catch {
     return undefined;
   }
@@ -33,7 +33,6 @@ function normalizeBaseURL(raw?: string): string {
 
   let url = raw.trim();
 
-  // enforce protocol
   if (!url.startsWith("http://") && !url.startsWith("https://")) {
     url = `https://${url}`;
   }
@@ -54,23 +53,27 @@ export class CloudVerseProvider implements LLMProvider {
   private baseURL: string;
 
   constructor(config: ZeverseConfig) {
-    const baseURL = normalizeBaseURL(
-      config.llm.base_url || process.env.CLOUDVERSE_BASE_URL
-    );
+    const rawBase =
+      config.llm.base_url || process.env.CLOUDVERSE_BASE_URL;
 
-    const apiKey = (config.llm.api_key || process.env.CLOUDVERSE_API_KEY || "").trim();
+    const apiKey =
+      config.llm.api_key || process.env.CLOUDVERSE_API_KEY || "";
 
-    if (!apiKey) {
-      throw new Error("Missing CLOUDVERSE_API_KEY environment variable");
+    if (!rawBase) {
+      throw new Error("CLOUDVERSE_BASE_URL is required");
     }
 
-    const expiredHint = cloudVerseJwtExpiredHint(apiKey);
+    if (!apiKey) {
+      throw new Error("CLOUDVERSE_API_KEY is required");
+    }
+
+    this.baseURL = normalizeBaseURL(rawBase);
+    this.apiKey = apiKey.trim();
+
+    const expiredHint = cloudVerseJwtExpiredHint(this.apiKey);
     if (expiredHint) {
       console.warn(`[CloudVerse] ${expiredHint}`);
     }
-
-    this.apiKey = apiKey;
-    this.baseURL = baseURL;
 
     console.log("[CloudVerse INIT]", {
       baseURL: this.baseURL,
@@ -79,9 +82,9 @@ export class CloudVerseProvider implements LLMProvider {
     });
 
     this.client = new OpenAI({
-      baseURL: this.baseURL,
       apiKey: this.apiKey,
-    });
+      baseURL: this.baseURL,
+    } as any);
 
     this.model = config.llm.model;
     this.maxTokens = config.llm.max_tokens;
@@ -98,22 +101,20 @@ export class CloudVerseProvider implements LLMProvider {
       });
 
       if (!response?.choices?.length) {
-        throw new Error(
-          `Invalid CloudVerse response (no choices). Model=${this.model}`
-        );
+        throw new Error("No choices returned from CloudVerse");
       }
 
       const choice = response.choices[0];
 
+      // ✅ FIXED: NO delta (only message.content exists in non-streaming)
       const content =
-        choice?.message?.content ??
-        choice?.delta?.content ??
-        (typeof choice?.text === "string" ? choice.text : "") ??
-        "";
+        typeof choice?.message?.content === "string"
+          ? choice.message.content
+          : "";
 
       if (!content) {
         throw new Error(
-          `Empty response from CloudVerse. finish_reason=${choice?.finish_reason}`
+          `Empty response from CloudVerse (finish_reason=${choice?.finish_reason})`
         );
       }
 
@@ -128,17 +129,19 @@ export class CloudVerseProvider implements LLMProvider {
             }
           : undefined,
       };
-    } catch (err: any) {
+    } catch (err: unknown) {
+      const error = err as any;
+
       console.error("[CloudVerse ERROR]", {
-        message: err?.message,
+        message: error?.message,
         baseURL: this.baseURL,
         model: this.model,
       });
 
       const detail =
-        err?.response?.data ||
-        err?.error ||
-        err?.message ||
+        error?.response?.data ||
+        error?.error ||
+        error?.message ||
         String(err);
 
       throw new Error(
