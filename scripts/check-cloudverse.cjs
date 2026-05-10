@@ -69,11 +69,7 @@ async function main() {
     console.log("(Key is not a 3-part JWT — skipping local expiry check)\n");
   }
 
-  const model =
-    process.env.CLOUDVERSE_TEST_MODEL ||
-    process.env.CLOUDVERSE_MODEL ||
-    "anthropic-claude-4-6-opus";
-
+  const model = "anthropic-claude-4-5-haiku";
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
