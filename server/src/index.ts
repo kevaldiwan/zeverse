@@ -15,7 +15,7 @@ import { harnessRoutes } from "./routes/harness";
 import { policyRoutes } from "./routes/policy";
 
 const app = express();
-const PORT = parseInt(process.env.ZEVERSE_SERVER_PORT ?? "3100", 10);
+const PORT = parseInt(process.env.PORT ?? "3100", 10);
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
