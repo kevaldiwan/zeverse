@@ -1,6 +1,6 @@
 llm:
   provider: custom
-  model: anthropic-claude-4-6-opus
+  model: anthropic-claude-4-5-haiku
   base_url: ${CLOUDVERSE_BASE_URL}
   api_key: ${CLOUDVERSE_API_KEY}
   max_tokens: 8192
