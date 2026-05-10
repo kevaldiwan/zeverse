@@ -69,7 +69,7 @@ async function main() {
     console.log("(Key is not a 3-part JWT — skipping local expiry check)\n");
   }
 
-  const model = "anthropic-claude-4-5-haiku";
+  const model = "gpt-5.4-mini";
   const res = await fetch(`${base}/chat/completions`, {
     method: "POST",
     headers: {
